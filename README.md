@@ -63,7 +63,30 @@ CAL_DB_PATH=data/calibration.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `uncalibrated_minutes` / `uncalibrated_minutes_utc`：**有读数却未校准**的
   分钟全量列表（追溯方核查时必须看到这些断档点）。
 
-### 2.4 版本与过期语义（关键）
+### 2.4 读数校时（采集器时钟偏移整批平移）
+
+针对“探头采集器时钟走快/走慢，已入库读数落错 UTC 时间”的修正手段，
+采用**两段式：先预览、再确认**：
+
+- **预览** `POST /api/readings/shift/preview`：输入探头、原分钟半开区间
+  `[start_minute, end_minute)` 和**整数分钟偏移**（可为负，不能为 0），
+  返回每条读数的新时间、目标冲突清单、受影响的 UTC 日和一个确认令牌
+  （`token`）；预览本身不改数据、不增版本号。
+- **确认** `POST /api/readings/shift/confirm`：凭令牌执行整批原子迁移
+  （单事务内先删源分钟再写目标分钟），`data_version` +1。
+- **占用规则**：区间内读数允许相互占用目标分钟（整批一起搬）；目标分钟
+  若被**区间外**读数占用则整批拒绝（409），绝不覆盖区间外数据。
+- **防陈旧/防重**：预览时把源读数与目标占用的指纹随令牌落库；确认时重算，
+  指纹不符（预览后源读数或目标占用变化）即拒绝并把令牌置为 `expired`；
+  同一令牌重复确认返回 409，不会二次平移。
+- **过期联动**：原日与新日受影响的 `serving` 发布立即过期（旧版仍可查）；
+  原日读数被迁空后，该日重算返回 404，不再供数，仅保留可查询的过期旧版。
+- 迁移失败（冲突/指纹不符/重复确认）整笔回滚：读数、版本号、过期标记
+  全部保持原状。
+- `GET /api/readings/shift/{token}` 可查令牌状态
+  （`previewed` / `confirmed` / `expired`）。
+
+### 2.5 版本与过期语义（关键）
 
 - 全局单调递增的 `data_version`（`/health` 可查）；每次成功的导入或证书变更
   都会 +1，失败不递增。
@@ -94,6 +117,9 @@ CAL_DB_PATH=data/calibration.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/api/readings/import` | multipart 字段 `file` 上传 CSV，或表单字段 `csv_text` |
 | GET  | `/api/readings?probe_id=&day=` | 查询读数（day 可选，`YYYY-MM-DD`） |
+| POST | `/api/readings/shift/preview` | 校时预览：新时间、冲突清单、确认令牌 |
+| POST | `/api/readings/shift/confirm` | 凭令牌确认整批迁移（仅一次有效） |
+| GET  | `/api/readings/shift/{token}` | 查询校时令牌状态 |
 | POST | `/api/certificates` | 新增证书（JSON） |
 | GET  | `/api/certificates?probe_id=` | 列出证书 |
 | PATCH | `/api/certificates/{id}` | 修改有效期/偏移（字段可选） |
@@ -138,13 +164,15 @@ P-01,2024-01-01T00:02Z,9.1
 
 ## 4. 网页界面
 
-访问根路径 `/`（自动跳转到 `/static/index.html`），四个操作区：
+访问根路径 `/`（自动跳转到 `/static/index.html`），五个操作区：
 
 1. **读数导入**：选择 CSV 文件或直接粘贴文本；展示插入/替换数与被置过期的日期；
 2. **校准证书**：表单新增，列表内可改（有效期/偏移）、可删，重叠时提示且不落库；
 3. **发布**：按探头 + UTC 日发布/重算，或一键全部重算；
 4. **版本查询**：表格展示每个发布版本的状态徽章（供数中/已过期/被替代）、
-   超温时段明细和“有读数却未校准”的分钟清单，可勾选查看全部历史版本。
+   超温时段明细和“有读数却未校准”的分钟清单，可勾选查看全部历史版本；
+5. **读数校时**：输入探头、原分钟半开区间与整数分钟偏移，先预览新时间与
+   冲突，再确认整批迁移；有冲突时确认按钮禁用，重复确认会被拒绝并提示。
 
 页头实时显示当前 `data_version`。
 
@@ -157,13 +185,17 @@ pip install -r requirements-dev.txt   # 含 pytest/httpx
 python -m pytest tests/ -q
 ```
 
-测试覆盖（共 30 个用例）：
+测试覆盖（共 42 个用例）：
 
 - 纯计算引擎：缺分钟/断档截断、半开证书边界、严格 >8 ℃、峰值统计、负偏移；
 - 导入：插入→更正替换、文件内重复折叠、ISO/整数时间、坏文件整笔回滚；
 - 证书：重叠 409、端点相接、非法半开区间、修改/删除/404；
 - 发布生命周期：serving →（更正/补证）→ stale → 重算 serving、历史 superseded、
   无读数 404、注入重算失败后 stale 旧版仍在；
+- 读数校时：跨日迁移与双日过期、原日迁空后不再供数、区间内相互占用允许、
+  区间外目标冲突 409 且状态不变、预览后源读数/目标占用变化拒绝并作废令牌、
+  重复确认不二次平移、5 线程并发确认仅 1 次成功、参数校验（空区间/零偏移/
+  非法时间/未知令牌）、与导入发布交错时新版只依据同一已提交快照；
 - 交错一致性：失败导入/失败改证不改状态、镜像状态逐版比对发布内容、
   4 线程并发（导入×15、改证×10、发布×12、坏导入×10）后所有不变量成立；
 - 边界：UTC 日界切分、多探头独立过期、按日过滤、ISO 渲染。
@@ -176,11 +208,11 @@ python -m pytest tests/ -q
 ```
 app/
   main.py        FastAPI 路由与异常映射
-  services.py    导入/证书/发布事务（写锁 + BEGIN IMMEDIATE）
+  services.py    导入/证书/发布/校时事务（写锁 + BEGIN IMMEDIATE）
   engine.py      纯函数：单日超温时段与未校准分钟计算
   db.py          SQLite 连接、WAL、schema、版本与过期标记
   timeutil.py    UTC 分钟/日转换
   static/index.html  单页网页
-tests/           pytest 套件
+tests/           pytest 套件（含 test_shift.py 校时专项）
 Dockerfile, docker-compose.yml, requirements.txt
 ```

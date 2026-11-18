@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from . import db, services
 from .timeutil import (
+    TimeFormatError,
     day_bounds,
     day_to_iso,
     minute_to_iso,
@@ -43,6 +44,11 @@ async def _service_error_handler(_: Request, exc: services.ServiceError) -> JSON
     return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
 
 
+@app.exception_handler(TimeFormatError)
+async def _time_format_error_handler(_: Request, exc: TimeFormatError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
 # --------------------------------------------------------------------------- #
 # Request / response models
 # --------------------------------------------------------------------------- #
@@ -62,6 +68,21 @@ class CertificatePatch(BaseModel):
 class PublishIn(BaseModel):
     probe_id: str
     day: str | int = Field(..., description="UTC 日，YYYY-MM-DD 或日序号")
+
+
+class ShiftPreviewIn(BaseModel):
+    probe_id: str = Field(..., description="探头号")
+    start_minute: str | int = Field(
+        ..., description="原分钟区间起（含），UTC 分钟或 ISO-8601"
+    )
+    end_minute: str | int = Field(
+        ..., description="原分钟区间止（不含），UTC 分钟或 ISO-8601"
+    )
+    offset_minutes: int = Field(..., description="整数分钟偏移（可为负，不能为 0）")
+
+
+class ShiftConfirmIn(BaseModel):
+    token: str = Field(..., description="预览返回的确认令牌")
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +161,34 @@ def list_readings(probe_id: str, day: Optional[str] = None) -> dict:
         }
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Reading time-shift (clock correction): preview -> confirm
+# --------------------------------------------------------------------------- #
+@app.post("/api/readings/shift/preview")
+def shift_preview(body: ShiftPreviewIn) -> dict:
+    """Preview a batch minute shift: new timestamps and target conflicts.
+
+    Returns a token; the migration only happens when the token is confirmed.
+    """
+    return services.preview_shift(
+        body.probe_id,
+        parse_utc_minute(body.start_minute),
+        parse_utc_minute(body.end_minute),
+        body.offset_minutes,
+    )
+
+
+@app.post("/api/readings/shift/confirm")
+def shift_confirm(body: ShiftConfirmIn) -> dict:
+    """Confirm a previewed shift. Atomic; a token can be confirmed only once."""
+    return services.confirm_shift(body.token)
+
+
+@app.get("/api/readings/shift/{token}")
+def shift_status(token: str) -> dict:
+    return services.get_shift(token)
 
 
 # --------------------------------------------------------------------------- #

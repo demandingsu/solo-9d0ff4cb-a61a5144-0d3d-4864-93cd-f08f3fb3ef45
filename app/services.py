@@ -1,4 +1,5 @@
-"""Business services: CSV import, calibration certificates, publishing.
+"""Business services: CSV import, calibration certificates, publishing,
+and two-phase reading time-shifts (preview -> confirm).
 
 Every mutating service runs inside :func:`app.db.write_tx`, i.e. it holds the
 global writer lock and a single ``BEGIN IMMEDIATE`` transaction. On any error
@@ -8,12 +9,14 @@ and no stale flag survives a failed import or certificate change.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import uuid
 
 from . import db
 from .engine import Calibration, ComputeError, Reading, compute_day
-from .timeutil import day_bounds, day_to_iso, parse_utc_minute
+from .timeutil import day_bounds, day_to_iso, minute_to_iso, parse_utc_minute
 
 PROBE_ALIASES = ("probe_id", "probe", "probeid", "sensor_id", "sensor", "探头号")
 MINUTE_ALIASES = (
@@ -428,3 +431,281 @@ def publish_many(probe_id: str | None, day: int | None) -> dict:
             )
     return {"total": len(results), "succeeded": sum(1 for r in results if r["ok"]),
             "failed": sum(1 for r in results if not r["ok"]), "results": results}
+
+
+# --------------------------------------------------------------------------- #
+# Reading time-shift (clock correction): two-phase preview -> confirm
+# --------------------------------------------------------------------------- #
+def _shift_snapshot(
+    conn, probe_id: str, start: int, end: int, offset: int
+) -> tuple[list[tuple[int, float]], list[int]]:
+    """Load the source readings and the blocking target minutes.
+
+    ``source`` is every reading inside the half-open ``[start, end)`` window.
+    ``blocking`` lists target minutes (``source minute + offset``) that are
+    occupied by readings *outside* the window — those may never be
+    overwritten. Target minutes occupied by other in-window readings are
+    fine: the whole batch moves atomically.
+    """
+    rows = conn.execute(
+        "SELECT minute_utc, temperature_c FROM readings "
+        "WHERE probe_id = ? AND minute_utc >= ? AND minute_utc < ? "
+        "ORDER BY minute_utc",
+        (probe_id, start, end),
+    ).fetchall()
+    source = [(int(r["minute_utc"]), float(r["temperature_c"])) for r in rows]
+
+    targets = {m + offset for m, _ in source}
+    blocking: list[int] = []
+    if targets:
+        lo, hi = min(targets), max(targets)
+        outside = conn.execute(
+            "SELECT minute_utc FROM readings "
+            "WHERE probe_id = ? AND minute_utc >= ? AND minute_utc <= ? "
+            "AND (minute_utc < ? OR minute_utc >= ?) ORDER BY minute_utc",
+            (probe_id, lo, hi, start, end),
+        ).fetchall()
+        blocking = [int(r["minute_utc"]) for r in outside
+                    if int(r["minute_utc"]) in targets]
+    return source, blocking
+
+
+def _shift_fingerprint(
+    probe_id: str,
+    start: int,
+    end: int,
+    offset: int,
+    source: list[tuple[int, float]],
+    blocking: list[int],
+) -> str:
+    """Hash everything a confirm must re-verify against its preview."""
+    blob = json.dumps(
+        {
+            "probe_id": probe_id,
+            "start": start,
+            "end": end,
+            "offset": offset,
+            "source": [[m, repr(t)] for m, t in source],
+            "blocking": blocking,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _validate_shift_args(probe_id: str, start: int, end: int, offset: int) -> None:
+    if not probe_id or not str(probe_id).strip():
+        raise ServiceError("探头号不能为空")
+    if start >= end:
+        raise ServiceError(
+            "原分钟区间必须是非空半开区间 [start_minute, end_minute)，"
+            "即 start_minute < end_minute"
+        )
+    if offset == 0:
+        raise ServiceError("偏移分钟不能为 0（无平移意义）")
+
+
+class _FingerprintMismatch(Exception):
+    """Internal: confirm observed data different from the preview snapshot."""
+
+
+def preview_shift(probe_id: str, start: int, end: int, offset: int) -> dict:
+    """Preview a batch time-shift and stash its fingerprint for confirmation.
+
+    Runs inside the writer transaction so the recorded snapshot is a real
+    committed state; it changes no readings and does not bump the version.
+    """
+    _validate_shift_args(probe_id, start, end, offset)
+    with db.write_tx() as conn:
+        source, blocking = _shift_snapshot(conn, probe_id, start, end, offset)
+        if not source:
+            raise ServiceError(
+                f"探头 {probe_id} 在区间 [{start}, {end}) 内没有读数，无法校时",
+                status_code=404,
+            )
+        fingerprint = _shift_fingerprint(
+            probe_id, start, end, offset, source, blocking
+        )
+        token = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO shift_operations(token, probe_id, start_minute, "
+            "end_minute, offset_minutes, fingerprint, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'previewed')",
+            (token, probe_id, start, end, offset, fingerprint),
+        )
+        source_days = sorted({m // 1440 for m, _ in source})
+        target_days = sorted({(m + offset) // 1440 for m, _ in source})
+        return {
+            "token": token,
+            "status": "previewed",
+            "probe_id": probe_id,
+            "start_minute": start,
+            "end_minute": end,
+            "start_iso": minute_to_iso(start),
+            "end_iso": minute_to_iso(end),
+            "offset_minutes": offset,
+            "reading_count": len(source),
+            "items": [
+                {
+                    "minute_utc": m,
+                    "minute_iso": minute_to_iso(m),
+                    "new_minute_utc": m + offset,
+                    "new_minute_iso": minute_to_iso(m + offset),
+                    "temperature_c": t,
+                }
+                for m, t in source
+            ],
+            "conflicts": [
+                {"minute_utc": b, "minute_iso": minute_to_iso(b)} for b in blocking
+            ],
+            "confirmable": not blocking,
+            "source_days": [day_to_iso(d) for d in source_days],
+            "target_days": [day_to_iso(d) for d in target_days],
+        }
+
+
+def confirm_shift(token: str) -> dict:
+    """Confirm a previously previewed shift; moves the whole batch atomically.
+
+    Refuses (HTTP 409) when:
+      * the token was already confirmed (no double shift) or has expired;
+      * the source readings or the target occupancy changed since the
+        preview (fingerprint mismatch — the token is then expired);
+      * target minutes are occupied by out-of-window readings.
+    On any refusal nothing changes: readings, data_version and stale flags
+    stay exactly as before (the transaction rolls back).
+    """
+    if not token or not str(token).strip():
+        raise ServiceError("确认令牌不能为空")
+    token = str(token).strip()
+
+    try:
+        with db.write_tx() as conn:
+            rec = conn.execute(
+                "SELECT * FROM shift_operations WHERE token = ?", (token,)
+            ).fetchone()
+            if rec is None:
+                raise ServiceError(f"校时预览 {token} 不存在", status_code=404)
+            if rec["status"] == "confirmed":
+                raise ServiceError(
+                    "该预览已确认过，不能重复平移；如需再次校时请重新预览",
+                    status_code=409,
+                )
+            if rec["status"] == "expired":
+                raise ServiceError(
+                    "该预览已失效（预览后数据曾变化），请重新预览",
+                    status_code=409,
+                )
+
+            probe_id = rec["probe_id"]
+            start = int(rec["start_minute"])
+            end = int(rec["end_minute"])
+            offset = int(rec["offset_minutes"])
+
+            source, blocking = _shift_snapshot(conn, probe_id, start, end, offset)
+            fingerprint = _shift_fingerprint(
+                probe_id, start, end, offset, source, blocking
+            )
+            if fingerprint != rec["fingerprint"]:
+                raise _FingerprintMismatch(token)
+            if blocking:
+                raise ServiceError(
+                    "目标分钟被区间外读数占用，整批迁移被拒绝"
+                    "（不得覆盖区间外读数）: "
+                    + ", ".join(minute_to_iso(b) for b in blocking),
+                    status_code=409,
+                )
+
+            version = db.bump_version(conn)
+            # Delete-then-insert inside one transaction: in-window readings may
+            # legitimately land on minutes previously held by other in-window
+            # readings, and the batch must move as one atomic unit.
+            conn.execute(
+                "DELETE FROM readings "
+                "WHERE probe_id = ? AND minute_utc >= ? AND minute_utc < ?",
+                (probe_id, start, end),
+            )
+            for m, t in source:
+                conn.execute(
+                    "INSERT INTO readings(probe_id, minute_utc, temperature_c, "
+                    "data_version) VALUES (?, ?, ?, ?)",
+                    (probe_id, m + offset, t, version),
+                )
+
+            # Both the original days and the target days are affected: their
+            # serving publications go stale immediately (old versions stay
+            # queryable). A source day left without readings can no longer be
+            # republished (publish_day -> 404), so it stops serving for good.
+            days = sorted(
+                {m // 1440 for m, _ in source}
+                | {(m + offset) // 1440 for m, _ in source}
+            )
+            stale = db.mark_days_stale(conn, probe_id, days)
+            conn.execute(
+                "UPDATE shift_operations SET status = 'confirmed', moved_rows = ?, "
+                "data_version = ?, "
+                "confirmed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE token = ?",
+                (len(source), version, token),
+            )
+            return {
+                "status": "committed",
+                "token": token,
+                "probe_id": probe_id,
+                "offset_minutes": offset,
+                "moved_rows": len(source),
+                "window": {
+                    "from": [start, end],
+                    "to": [start + offset, end + offset],
+                    "from_iso": [minute_to_iso(start), minute_to_iso(end)],
+                    "to_iso": [
+                        minute_to_iso(start + offset),
+                        minute_to_iso(end + offset),
+                    ],
+                },
+                "data_version": version,
+                "stale_publications": stale,
+                "stale_days": [day_to_iso(d) for d in days],
+            }
+    except _FingerprintMismatch:
+        # The migration itself changed nothing (the transaction above rolled
+        # back). Expire the token in its own small transaction so this preview
+        # can never be confirmed against a different data state later.
+        with db.write_tx() as conn:
+            conn.execute(
+                "UPDATE shift_operations SET status = 'expired' "
+                "WHERE token = ? AND status = 'previewed'",
+                (token,),
+            )
+        raise ServiceError(
+            "预览后源读数或目标占用已变化，本次确认被拒绝，请重新预览",
+            status_code=409,
+        )
+
+
+def get_shift(token: str) -> dict:
+    """Report the current state of a preview/confirmation token."""
+    conn = db.connect()
+    try:
+        rec = conn.execute(
+            "SELECT * FROM shift_operations WHERE token = ?", (token,)
+        ).fetchone()
+        if rec is None:
+            raise ServiceError(f"校时预览 {token} 不存在", status_code=404)
+        return {
+            "token": rec["token"],
+            "probe_id": rec["probe_id"],
+            "start_minute": rec["start_minute"],
+            "end_minute": rec["end_minute"],
+            "start_iso": minute_to_iso(rec["start_minute"]),
+            "end_iso": minute_to_iso(rec["end_minute"]),
+            "offset_minutes": rec["offset_minutes"],
+            "status": rec["status"],
+            "moved_rows": rec["moved_rows"],
+            "data_version": rec["data_version"],
+            "created_at": rec["created_at"],
+            "confirmed_at": rec["confirmed_at"],
+        }
+    finally:
+        conn.close()

@@ -125,6 +125,24 @@ P-01,28801,8.6"></textarea>
     </div>
     <div id="pubTable"></div>
   </section>
+
+  <!-- 5. 读数校时 -->
+  <section class="card wide">
+    <h2>5. 读数校时（采集器时钟偏移整批平移）<span class="tag">先预览，再确认；确认仅一次有效</span></h2>
+    <div class="row">
+      <div><label>探头号</label><input id="shiftProbe" placeholder="P-01" /></div>
+      <div><label>原区间起（含）</label><input id="shiftStart" placeholder="28800 或 2024-01-01T00:00Z" /></div>
+      <div><label>原区间止（不含）</label><input id="shiftEnd" placeholder="28860 或 2024-01-01T01:00Z" /></div>
+      <div><label>偏移分钟（整数，负值回拨）</label><input id="shiftOffset" placeholder="-3" /></div>
+      <div style="flex:0"><button id="btnShiftPreview">预览校时</button></div>
+      <div style="flex:0"><button class="danger" id="btnShiftConfirm" disabled>确认整批迁移</button></div>
+    </div>
+    <div class="hint">区间内读数允许相互占用目标分钟；目标分钟若被<b>区间外</b>读数占用则整批拒绝，
+      绝不覆盖。预览之后源读数或目标占用发生变化、或同一预览重复确认，都会被拒绝（数据保持原状）。
+      确认后原日与新日的已发布版本立即过期（旧版仍可查），原日读数迁空后将不再供数。</div>
+    <div id="shiftPreview"></div>
+    <pre class="out" id="shiftOut">等待操作…</pre>
+  </section>
 </main>
 
 <script>
@@ -285,6 +303,60 @@ function renderPublications(items) {
 }
 
 refreshMeta();
+
+// ---------- 5. 读数校时 ----------
+let shiftToken = null;
+
+function renderShiftPreview(r) {
+  const rows = r.items.map(it => `<tr>
+    <td class="mono">${it.minute_iso}</td><td class="mono">${it.new_minute_iso}</td>
+    <td>${it.temperature_c}</td></tr>`).join("");
+  const conflicts = r.conflicts.length
+    ? `<p class="err">目标分钟被区间外读数占用（${r.conflicts.length} 个），禁止确认：<br>` +
+      `<span class="mono">${r.conflicts.map(c => c.minute_iso).join(", ")}</span></p>`
+    : '<p class="ok">无冲突，可确认。</p>';
+  $("shiftPreview").innerHTML =
+    `<p>预览令牌 <span class="mono">${r.token}</span> · 共 ${r.reading_count} 条读数，` +
+    `偏移 ${r.offset_minutes} 分钟；影响原日 [${r.source_days.join(", ")}] → ` +
+    `新日 [${r.target_days.join(", ")}]</p>` + conflicts +
+    `<div style="max-height:220px;overflow:auto"><table>` +
+    `<tr><th>原分钟 UTC</th><th>新分钟 UTC</th><th>温度℃</th></tr>${rows}</table></div>`;
+}
+
+$("btnShiftPreview").onclick = async () => {
+  shiftToken = null;
+  $("btnShiftConfirm").disabled = true;
+  $("shiftPreview").innerHTML = "";
+  try {
+    const off = Number($("shiftOffset").value);
+    if (!Number.isInteger(off)) throw new Error("偏移必须是整数分钟（可为负，不能为 0）");
+    const r = await jsonPost("/api/readings/shift/preview", {
+      probe_id: $("shiftProbe").value.trim(),
+      start_minute: $("shiftStart").value.trim(),
+      end_minute: $("shiftEnd").value.trim(),
+      offset_minutes: off
+    });
+    shiftToken = r.token;
+    renderShiftPreview(r);
+    $("btnShiftConfirm").disabled = !r.confirmable;
+    out("shiftOut", r.confirmable
+      ? "预览成功，无冲突；核对上表后可点“确认整批迁移”。"
+      : "预览完成：存在目标冲突，确认会被拒绝，请先处理区间外占用。");
+  } catch (e) { out("shiftOut", "预览失败（数据未改动）: " + e.message, true); }
+};
+
+$("btnShiftConfirm").onclick = async () => {
+  if (!shiftToken) { out("shiftOut", "请先预览，再确认。", true); return; }
+  try {
+    const r = await jsonPost("/api/readings/shift/confirm", {token: shiftToken});
+    out("shiftOut", r);
+    $("shiftPreview").innerHTML =
+      `<p class="ok">已迁移 ${r.moved_rows} 条读数（数据版本 v${r.data_version}）；` +
+      `置过期日期：${r.stale_days.join(", ") || "无"}。` +
+      `再次点击“确认整批迁移”可验证重复确认会被拒绝。</p>`;
+    await refreshMeta();
+  } catch (e) { out("shiftOut", "确认被拒绝（数据未改动）: " + e.message, true); }
+};
 </script>
 </body>
 </html>

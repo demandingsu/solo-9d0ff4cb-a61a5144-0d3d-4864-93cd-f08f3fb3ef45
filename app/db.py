@@ -61,6 +61,23 @@ CREATE TABLE IF NOT EXISTS publications (
 CREATE INDEX IF NOT EXISTS idx_pub_lookup
     ON publications(probe_id, day, status);
 CREATE INDEX IF NOT EXISTS idx_pub_version ON publications(data_version);
+
+-- 读数校时（整批分钟平移）的预览/确认记录。预览把源读数与目标占用的
+-- 指纹落库；确认时重算指纹，不一致或重复确认都拒绝，保证“预览-确认”
+-- 两段式操作不会被数据变化或重试破坏。
+CREATE TABLE IF NOT EXISTS shift_operations (
+    token          TEXT PRIMARY KEY,
+    probe_id       TEXT NOT NULL,
+    start_minute   INTEGER NOT NULL,
+    end_minute     INTEGER NOT NULL,
+    offset_minutes INTEGER NOT NULL,
+    fingerprint    TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('previewed', 'confirmed', 'expired')),
+    moved_rows     INTEGER,
+    data_version   INTEGER,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    confirmed_at   TEXT
+);
 """
 
 
