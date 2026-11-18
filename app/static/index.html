@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>冷链探头校准数据集</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #fff; --line: #d9dee5; --text: #1f2933;
+    --blue: #2563eb; --red: #dc2626; --amber: #b45309; --green: #15803d;
+    --muted: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { background: #0f172a; color: #fff; padding: 14px 24px; display: flex;
+           align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .meta { font-size: 13px; color: #cbd5e1; }
+  main { max-width: 1180px; margin: 20px auto; padding: 0 16px; display: grid;
+         grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px 18px; }
+  .card.wide { grid-column: 1 / -1; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .tag { font-weight: normal; font-size: 12px; color: var(--muted); }
+  label { font-size: 13px; color: var(--muted); display: block; margin: 8px 0 4px; }
+  input, textarea, select { width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+          border-radius: 6px; font-size: 13px; font-family: inherit; }
+  textarea { min-height: 130px; resize: vertical; font-family: ui-monospace, monospace; }
+  button { background: var(--blue); color: #fff; border: 0; border-radius: 6px;
+           padding: 8px 14px; font-size: 13px; cursor: pointer; margin-top: 10px; }
+  button.secondary { background: #475569; }
+  button.danger { background: var(--red); }
+  button.ghost { background: #e2e8f0; color: var(--text); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+  th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left;
+           vertical-align: top; }
+  th { background: #f1f5f9; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+  .badge.serving { background: #dcfce7; color: var(--green); }
+  .badge.stale { background: #fee2e2; color: var(--red); }
+  .badge.superseded { background: #fef3c7; color: var(--amber); }
+  pre.out { background: #0f172a; color: #d1fae5; padding: 10px; border-radius: 8px;
+            font-size: 12px; overflow: auto; max-height: 260px; margin: 10px 0 0; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+  .ok { color: var(--green); } .err { color: var(--red); }
+  .mono { font-family: ui-monospace, monospace; }
+  .seg-empty { color: var(--muted); font-style: italic; }
+  .uncal { color: var(--amber); }
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .filters > div { flex: 1; min-width: 130px; }
+  .checkbox { display: flex; align-items: center; gap: 6px; }
+  .checkbox input { width: auto; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .cert-actions button { margin: 0 0 0 6px; padding: 4px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>冷链探头校准数据集</h1>
+  <span class="meta">FastAPI + SQLite · 时间均为 UTC · 当前数据版本：<b id="dataVersion">…</b></span>
+  <button class="ghost" id="refreshMeta" style="margin-top:0">刷新状态</button>
+</header>
+
+<main>
+  <!-- 1. CSV 导入 -->
+  <section class="card">
+    <h2>1. 读数导入（CSV）<span class="tag">同探头同分钟 → 更正替换</span></h2>
+    <input type="file" id="csvFile" accept=".csv,text/csv" />
+    <label>或直接粘贴 CSV 文本（表头：probe_id,minute_utc,temperature_c）</label>
+    <textarea id="csvText" placeholder="probe_id,minute_utc,temperature_c
+P-01,28800,7.5
+P-01,28801,8.6"></textarea>
+    <div class="row">
+      <button id="btnImport">导入 / 更正</button>
+      <button class="secondary" id="btnSample">填入示例</button>
+    </div>
+    <div class="hint">minute_utc 支持 Unix 分钟整数或 ISO（如 2024-01-01T00:00Z）；
+      导入成功会提升数据版本，并把受影响日期的已发布版本立即标记为“过期”。</div>
+    <pre class="out" id="importOut">等待操作…</pre>
+  </section>
+
+  <!-- 2. 校准证书 -->
+  <section class="card">
+    <h2>2. 校准证书<span class="tag">半开 [from, to)、同探头互不重叠</span></h2>
+    <div class="row">
+      <div><label>探头号</label><input id="certProbe" placeholder="P-01" /></div>
+      <div><label>偏移 offset_c（℃）</label><input id="certOffset" placeholder="0.2" /></div>
+    </div>
+    <div class="row">
+      <div><label>valid_from（含）</label><input id="certFrom" placeholder="28800 或 2024-01-01T00:00Z" /></div>
+      <div><label>valid_to（不含）</label><input id="certTo" placeholder="28944 或 2024-01-02T00:00Z" /></div>
+    </div>
+    <button id="btnAddCert">新增证书</button>
+    <button class="secondary" id="btnListCert">刷新证书列表</button>
+    <div class="hint">端点相接（…,b) 与 [b,…）允许；任何重叠返回 409 且不改动数据。</div>
+    <div id="certTable"></div>
+    <pre class="out" id="certOut">等待操作…</pre>
+  </section>
+
+  <!-- 3. 发布 -->
+  <section class="card wide">
+    <h2>3. 发布校准后超温时段（&gt; 8℃ 的连续分钟）<span class="tag">缺分钟 / 证书断档即截断</span></h2>
+    <div class="row">
+      <div><label>探头号</label><input id="pubProbe" placeholder="P-01" /></div>
+      <div><label>UTC 日</label><input id="pubDay" placeholder="2024-01-01" /></div>
+      <div style="flex:0"><button id="btnPublish">发布 / 重算该日</button></div>
+      <div style="flex:0"><button class="secondary" id="btnRecomputeAll">全部重算</button></div>
+    </div>
+    <div class="hint">重算在单个事务内完成：失败时旧版（含“过期”旧版）仍可查询，供数版本不会被半成品替换。</div>
+    <pre class="out" id="pubOut">等待操作…</pre>
+  </section>
+
+  <!-- 4. 查询 -->
+  <section class="card wide">
+    <h2>4. 已发布版本查询<span class="tag">过期旧版仍可查询，重算成功才替换供数版本</span></h2>
+    <div class="filters">
+      <div><label>探头号（可选）</label><input id="qProbe" /></div>
+      <div><label>UTC 日（可选，YYYY-MM-DD）</label><input id="qDay" /></div>
+      <div class="checkbox"><input type="checkbox" id="qHistory" /><label for="qHistory" style="margin:0">含历史版本</label></div>
+      <div style="flex:0"><button id="btnQuery">查询</button></div>
+    </div>
+    <div id="pubTable"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = (id, data, isErr) => {
+  const el = $(id);
+  el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  el.style.color = isErr ? "#fca5a5" : "#d1fae5";
+};
+
+async function call(url, opts) {
+  const resp = await fetch(url, opts);
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(body.error || ("HTTP " + resp.status));
+  return body;
+}
+const jsonPost = (url, body) => call(url, {
+  method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+});
+
+async function refreshMeta() {
+  try {
+    const h = await call("/health");
+    $("dataVersion").textContent = h.data_version;
+  } catch (e) { $("dataVersion").textContent = "不可用"; }
+}
+
+// ---------- 1. 导入 ----------
+$("btnSample").onclick = () => {
+  $("csvText").value =
+    "probe_id,minute_utc,temperature_c\n" +
+    "P-01,28800,7.4\nP-01,28801,8.3\nP-01,28802,9.1\n" +
+    "P-01,28803,9.4\nP-01,28805,8.8\nP-01,28806,7.9\n";
+};
+$("btnImport").onclick = async () => {
+  try {
+    const fd = new FormData();
+    const f = $("csvFile").files[0];
+    if (f) fd.append("file", f);
+    else if ($("csvText").value.trim()) fd.append("csv_text", $("csvText").value);
+    else throw new Error("请选择 CSV 文件或粘贴 CSV 文本");
+    const r = await call("/api/readings/import", {method: "POST", body: fd});
+    out("importOut", r); await refreshMeta();
+  } catch (e) { out("importOut", "导入失败（数据未改动）: " + e.message, true); }
+};
+
+// ---------- 2. 证书 ----------
+$("btnAddCert").onclick = async () => {
+  try {
+    const r = await jsonPost("/api/certificates", {
+      probe_id: $("certProbe").value.trim(),
+      valid_from: $("certFrom").value.trim(),
+      valid_to: $("certTo").value.trim(),
+      offset_c: parseFloat($("certOffset").value)
+    });
+    out("certOut", r); await refreshMeta(); loadCerts($("certProbe").value.trim());
+  } catch (e) { out("certOut", "新增失败（数据未改动）: " + e.message, true); }
+};
+$("btnListCert").onclick = () => loadCerts($("certProbe").value.trim());
+
+async function loadCerts(probe) {
+  const url = "/api/certificates" + (probe ? "?probe_id=" + encodeURIComponent(probe) : "");
+  const r = await call(url);
+  if (!r.count) { $("certTable").innerHTML = '<p class="muted">暂无证书</p>'; return; }
+  $("certTable").innerHTML = "<table><tr><th>ID</th><th>探头</th><th>有效期 [from, to)</th>" +
+    "<th>偏移℃</th><th>版本</th><th>操作</th></tr>" +
+    r.certificates.map(c => `<tr>
+      <td>${c.id}</td><td>${c.probe_id}</td>
+      <td class="mono">${c.valid_from_iso}<br>→ ${c.valid_to_iso}<br>(${c.valid_from}–${c.valid_to})</td>
+      <td>${c.offset_c}</td><td>v${c.data_version}</td>
+      <td class="cert-actions">
+        <button class="ghost" onclick="editCert(${c.id})">改</button>
+        <button class="danger" onclick="delCert(${c.id})">删</button>
+      </td></tr>`).join("") + "</table>";
+}
+window.delCert = async (id) => {
+  if (!confirm("确认删除证书 #" + id + "？受影响的已发布日期将立即过期。")) return;
+  try { out("certOut", await call("/api/certificates/" + id, {method: "DELETE"}));
+        await refreshMeta(); loadCerts($("certProbe").value.trim()); }
+  catch (e) { out("certOut", "删除失败: " + e.message, true); }
+};
+window.editCert = async (id) => {
+  const from = prompt("新 valid_from（留空保持不变；UTC 分钟或 ISO）", "");
+  if (from === null) return;
+  const to = prompt("新 valid_to（留空保持不变）", "");
+  if (to === null) return;
+  const off = prompt("新 offset_c（留空保持不变）", "");
+  if (off === null) return;
+  const body = {};
+  if (from.trim()) body.valid_from = from.trim();
+  if (to.trim()) body.valid_to = to.trim();
+  if (off.trim()) body.offset_c = parseFloat(off);
+  try {
+    out("certOut", await call("/api/certificates/" + id, {
+      method: "PATCH", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body)}));
+    await refreshMeta(); loadCerts($("certProbe").value.trim());
+  } catch (e) { out("certOut", "修改失败（数据未改动）: " + e.message, true); }
+};
+
+// ---------- 3. 发布 ----------
+$("btnPublish").onclick = async () => {
+  try {
+    const r = await jsonPost("/api/publications", {
+      probe_id: $("pubProbe").value.trim(), day: $("pubDay").value.trim()
+    });
+    out("pubOut", r); await refreshMeta();
+  } catch (e) { out("pubOut", "发布失败（旧版仍可查询）: " + e.message, true); }
+};
+$("btnRecomputeAll").onclick = async () => {
+  const probe = $("pubProbe").value.trim();
+  const params = new URLSearchParams();
+  if (probe) params.set("probe_id", probe);
+  try {
+    out("pubOut", await call("/api/publications/recompute-all?" + params.toString(),
+                             {method: "POST"}));
+    await refreshMeta();
+  } catch (e) { out("pubOut", "重算失败: " + e.message, true); }
+};
+
+// ---------- 4. 查询 ----------
+$("btnQuery").onclick = async () => {
+  try {
+    const p = new URLSearchParams();
+    if ($("qProbe").value.trim()) p.set("probe_id", $("qProbe").value.trim());
+    if ($("qDay").value.trim()) p.set("day", $("qDay").value.trim());
+    if ($("qHistory").checked) p.set("include_history", "true");
+    const r = await call("/api/publications?" + p.toString());
+    renderPublications(r.publications);
+  } catch (e) { $("pubTable").innerHTML = '<p class="err">查询失败: ' + e.message + "</p>"; }
+};
+
+function renderPublications(items) {
+  if (!items || !items.length) {
+    $("pubTable").innerHTML = '<p class="muted">没有匹配的已发布版本</p>'; return;
+  }
+  const rows = items.map(it => {
+    const p = it.payload;
+    const segs = p.segments.length
+      ? "<table><tr><th>起 UTC</th><th>止 UTC（不含）</th><th>分钟数</th><th>峰值℃</th></tr>" +
+        p.segments.map(s => `<tr><td class="mono">${s.start_utc}</td><td class="mono">${s.end_utc}</td>
+          <td>${s.duration_minutes}</td><td>${s.max_calibrated_c}</td></tr>`).join("") + "</table>"
+      : '<span class="seg-empty">无超温连续时段</span>';
+    const uncal = p.uncalibrated_minutes_utc.length
+      ? `<div class="uncal">有读数却未校准（${p.uncalibrated_minutes_utc.length} 分钟，已截断时段）：<br>` +
+        `<span class="mono">${p.uncalibrated_minutes_utc.join(", ")}</span></div>`
+      : '<span class="muted">全部读数均在证书有效期内</span>';
+    return `<tr>
+      <td>${it.publication_id}<br><span class="badge ${it.status}">${
+          {serving: "供数中", stale: "已过期", superseded: "被替代"}[it.status]}</span></td>
+      <td>${it.probe_id}</td><td>${it.day_utc}</td><td>v${it.data_version}</td>
+      <td>读数 ${p.total_reading_minutes} 分钟 / 已校准 ${p.calibrated_minutes} 分钟</td>
+      <td>${segs}${uncal}</td>
+    </tr>`;
+  }).join("");
+  $("pubTable").innerHTML = "<table><tr><th>版本</th><th>探头</th><th>UTC 日</th>" +
+    "<th>数据版本</th><th>覆盖</th><th>发布内容</th></tr>" + rows + "</table>";
+}
+
+refreshMeta();
+</script>
+</body>
+</html>

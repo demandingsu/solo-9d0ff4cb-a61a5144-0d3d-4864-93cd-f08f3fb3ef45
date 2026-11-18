@@ -1,0 +1,4 @@
+-r requirements.txt
+# 本地测试依赖（运行期不需要，Docker 镜像不安装）
+httpx==0.28.1
+pytest==9.2.0
